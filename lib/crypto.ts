@@ -1,4 +1,5 @@
-import sodium from "libsodium-wrappers"
+import nacl from "tweetnacl"
+import { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } from "tweetnacl-util"
 
 export class CryptoManager {
   private static instance: CryptoManager
@@ -15,140 +16,135 @@ export class CryptoManager {
 
   async initialize(): Promise<void> {
     if (!this.isReady) {
-      await sodium.ready
+      // tweetnacl doesn't require async initialization
       this.isReady = true
     }
   }
 
-  // Generate asymmetric key pair for user identity
   generateKeyPair(): { publicKey: string; privateKey: string } {
-    const keyPair = sodium.crypto_box_keypair()
+    const keyPair = nacl.box.keyPair()
     return {
-      publicKey: sodium.to_hex(keyPair.publicKey),
-      privateKey: sodium.to_hex(keyPair.privateKey),
+      publicKey: encodeBase64(keyPair.publicKey),
+      privateKey: encodeBase64(keyPair.secretKey),
     }
   }
 
-  // Generate signing key pair for message authentication
   generateSigningKeyPair(): { publicKey: string; privateKey: string } {
-    const keyPair = sodium.crypto_sign_keypair()
+    const keyPair = nacl.sign.keyPair()
     return {
-      publicKey: sodium.to_hex(keyPair.publicKey),
-      privateKey: sodium.to_hex(keyPair.privateKey),
+      publicKey: encodeBase64(keyPair.publicKey),
+      privateKey: encodeBase64(keyPair.secretKey),
     }
   }
 
-  // Generate user ID from public key using secure hash
   generateUserId(publicKey: string): string {
-    const hash = sodium.crypto_generichash(32, sodium.from_hex(publicKey))
-    return sodium.to_hex(hash)
+    const hash = nacl.hash(decodeBase64(publicKey))
+    return encodeBase64(hash)
   }
 
   encryptDirectMessage(message: string, recipientPublicKey: string, senderPrivateKey: string): string {
-    const messageBytes = sodium.from_string(message)
-    const recipientPubKey = sodium.from_hex(recipientPublicKey)
-    const senderPrivKey = sodium.from_hex(senderPrivateKey)
-    const nonce = sodium.randombytes_buf(sodium.crypto_box_NONCEBYTES)
+    const messageBytes = encodeUTF8(message)
+    const nonce = nacl.randomBytes(nacl.box.nonceLength)
+    const recipientPubKey = decodeBase64(recipientPublicKey)
+    const senderPrivKey = decodeBase64(senderPrivateKey)
 
-    const encrypted = sodium.crypto_box_easy(messageBytes, nonce, recipientPubKey, senderPrivKey)
+    const encrypted = nacl.box(messageBytes, nonce, recipientPubKey, senderPrivKey)
 
     // Combine nonce and encrypted data
     const combined = new Uint8Array(nonce.length + encrypted.length)
     combined.set(nonce)
     combined.set(encrypted, nonce.length)
 
-    return sodium.to_hex(combined)
+    return encodeBase64(combined)
   }
 
   decryptDirectMessage(encryptedMessage: string, senderPublicKey: string, recipientPrivateKey: string): string {
-    const combined = sodium.from_hex(encryptedMessage)
-    const nonce = combined.slice(0, sodium.crypto_box_NONCEBYTES)
-    const encrypted = combined.slice(sodium.crypto_box_NONCEBYTES)
-    const senderPubKey = sodium.from_hex(senderPublicKey)
-    const recipientPrivKey = sodium.from_hex(recipientPrivateKey)
+    const combined = decodeBase64(encryptedMessage)
+    const nonce = combined.slice(0, nacl.box.nonceLength)
+    const encrypted = combined.slice(nacl.box.nonceLength)
+    const senderPubKey = decodeBase64(senderPublicKey)
+    const recipientPrivKey = decodeBase64(recipientPrivateKey)
 
-    const decrypted = sodium.crypto_box_open_easy(encrypted, nonce, senderPubKey, recipientPrivKey)
-    return sodium.to_string(decrypted)
+    const decrypted = nacl.box.open(encrypted, nonce, senderPubKey, recipientPrivKey)
+    if (!decrypted) {
+      throw new Error("Decryption failed")
+    }
+    return decodeUTF8(decrypted)
   }
 
-  // Generate symmetric key for group chat
   generateSymmetricKey(): string {
-    const key = sodium.crypto_secretbox_keygen()
-    return sodium.to_hex(key)
+    const key = nacl.randomBytes(nacl.secretbox.keyLength)
+    return encodeBase64(key)
   }
 
   encryptGroupMessage(message: string, symmetricKey: string): string {
-    const messageBytes = sodium.from_string(message)
-    const key = sodium.from_hex(symmetricKey)
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+    const messageBytes = encodeUTF8(message)
+    const key = decodeBase64(symmetricKey)
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength)
 
-    const encrypted = sodium.crypto_secretbox_easy(messageBytes, nonce, key)
+    const encrypted = nacl.secretbox(messageBytes, nonce, key)
 
     // Combine nonce and encrypted data
     const combined = new Uint8Array(nonce.length + encrypted.length)
     combined.set(nonce)
     combined.set(encrypted, nonce.length)
 
-    return sodium.to_hex(combined)
+    return encodeBase64(combined)
   }
 
   decryptGroupMessage(encryptedMessage: string, symmetricKey: string): string {
-    const combined = sodium.from_hex(encryptedMessage)
-    const nonce = combined.slice(0, sodium.crypto_secretbox_NONCEBYTES)
-    const encrypted = combined.slice(sodium.crypto_secretbox_NONCEBYTES)
-    const key = sodium.from_hex(symmetricKey)
+    const combined = decodeBase64(encryptedMessage)
+    const nonce = combined.slice(0, nacl.secretbox.nonceLength)
+    const encrypted = combined.slice(nacl.secretbox.nonceLength)
+    const key = decodeBase64(symmetricKey)
 
-    const decrypted = sodium.crypto_secretbox_open_easy(encrypted, nonce, key)
-    return sodium.to_string(decrypted)
+    const decrypted = nacl.secretbox.open(encrypted, nonce, key)
+    if (!decrypted) {
+      throw new Error("Decryption failed")
+    }
+    return decodeUTF8(decrypted)
   }
 
-  // Sign message for authenticity
   signMessage(message: string, privateKey: string): string {
-    const messageBytes = sodium.from_string(message)
-    const privKey = sodium.from_hex(privateKey)
-    const signature = sodium.crypto_sign_detached(messageBytes, privKey)
-    return sodium.to_hex(signature)
+    const messageBytes = encodeUTF8(message)
+    const privKey = decodeBase64(privateKey)
+    const signature = nacl.sign.detached(messageBytes, privKey)
+    return encodeBase64(signature)
   }
 
-  // Verify message signature
   verifySignature(message: string, signature: string, publicKey: string): boolean {
     try {
-      const messageBytes = sodium.from_string(message)
-      const sig = sodium.from_hex(signature)
-      const pubKey = sodium.from_hex(publicKey)
-      return sodium.crypto_sign_verify_detached(sig, messageBytes, pubKey)
+      const messageBytes = encodeUTF8(message)
+      const sig = decodeBase64(signature)
+      const pubKey = decodeBase64(publicKey)
+      return nacl.sign.detached.verify(messageBytes, sig, pubKey)
     } catch {
       return false
     }
   }
 
   deriveKeyFromPassword(password: string, salt: string): string {
-    const saltBytes = sodium.from_hex(salt)
-    const key = sodium.crypto_pwhash(
-      32, // key length
-      sodium.from_string(password),
-      saltBytes,
-      sodium.crypto_pwhash_OPSLIMIT_INTERACTIVE,
-      sodium.crypto_pwhash_MEMLIMIT_INTERACTIVE,
-      sodium.crypto_pwhash_ALG_ARGON2ID,
-    )
-    return sodium.to_hex(key)
+    // Note: tweetnacl doesn't have built-in scrypt, using hash as fallback
+    // For production, consider using @noble/hashes or similar
+    const combined = encodeUTF8(password + salt)
+    const hash = nacl.hash(combined)
+    return encodeBase64(hash.slice(0, nacl.secretbox.keyLength))
   }
 
   generateSalt(): string {
-    const salt = sodium.randombytes_buf(sodium.crypto_pwhash_SALTBYTES)
-    return sodium.to_hex(salt)
+    const salt = nacl.randomBytes(16)
+    return encodeBase64(salt)
   }
 
   encryptPrivateKey(privateKey: string, password: string): { encryptedKey: string; salt: string } {
     const salt = this.generateSalt()
     const derivedKey = this.deriveKeyFromPassword(password, salt)
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength)
 
-    const privateKeyBytes = sodium.from_hex(privateKey)
-    const keyBytes = sodium.from_hex(derivedKey)
+    const privateKeyBytes = decodeBase64(privateKey)
+    const keyBytes = decodeBase64(derivedKey)
 
-    const encrypted = sodium.crypto_secretbox_easy(privateKeyBytes, nonce, keyBytes)
+    const encrypted = nacl.secretbox(privateKeyBytes, nonce, keyBytes)
 
     // Combine nonce and encrypted data
     const combined = new Uint8Array(nonce.length + encrypted.length)
@@ -156,31 +152,34 @@ export class CryptoManager {
     combined.set(encrypted, nonce.length)
 
     return {
-      encryptedKey: sodium.to_hex(combined),
+      encryptedKey: encodeBase64(combined),
       salt,
     }
   }
 
   decryptPrivateKey(encryptedKey: string, password: string, salt: string): string {
     const derivedKey = this.deriveKeyFromPassword(password, salt)
-    const combined = sodium.from_hex(encryptedKey)
-    const nonce = combined.slice(0, sodium.crypto_secretbox_NONCEBYTES)
-    const encrypted = combined.slice(sodium.crypto_secretbox_NONCEBYTES)
-    const keyBytes = sodium.from_hex(derivedKey)
+    const combined = decodeBase64(encryptedKey)
+    const nonce = combined.slice(0, nacl.secretbox.nonceLength)
+    const encrypted = combined.slice(nacl.secretbox.nonceLength)
+    const keyBytes = decodeBase64(derivedKey)
 
-    const decrypted = sodium.crypto_secretbox_open_easy(encrypted, nonce, keyBytes)
-    return sodium.to_hex(decrypted)
+    const decrypted = nacl.secretbox.open(encrypted, nonce, keyBytes)
+    if (!decrypted) {
+      throw new Error("Decryption failed")
+    }
+    return encodeBase64(decrypted)
   }
 
   generateSecureId(): string {
-    const randomBytes = sodium.randombytes_buf(16)
-    return sodium.to_hex(randomBytes)
+    const randomBytes = nacl.randomBytes(16)
+    return encodeBase64(randomBytes)
   }
 
   generateMessageHash(content: string, timestamp: number, senderId: string): string {
     const data = `${content}${timestamp}${senderId}`
-    const hash = sodium.crypto_generichash(32, sodium.from_string(data))
-    return sodium.to_hex(hash)
+    const hash = nacl.hash(encodeUTF8(data))
+    return encodeBase64(hash)
   }
 
   encryptEphemeralMessage(
@@ -219,12 +218,12 @@ export class CryptoManager {
   encryptBackupData(data: any, password: string): { encryptedData: string; salt: string } {
     const salt = this.generateSalt()
     const derivedKey = this.deriveKeyFromPassword(password, salt)
-    const nonce = sodium.randombytes_buf(sodium.crypto_secretbox_NONCEBYTES)
+    const nonce = nacl.randomBytes(nacl.secretbox.nonceLength)
 
-    const dataBytes = sodium.from_string(JSON.stringify(data))
-    const keyBytes = sodium.from_hex(derivedKey)
+    const dataBytes = encodeUTF8(JSON.stringify(data))
+    const keyBytes = decodeBase64(derivedKey)
 
-    const encrypted = sodium.crypto_secretbox_easy(dataBytes, nonce, keyBytes)
+    const encrypted = nacl.secretbox(dataBytes, nonce, keyBytes)
 
     // Combine nonce and encrypted data
     const combined = new Uint8Array(nonce.length + encrypted.length)
@@ -232,20 +231,23 @@ export class CryptoManager {
     combined.set(encrypted, nonce.length)
 
     return {
-      encryptedData: sodium.to_hex(combined),
+      encryptedData: encodeBase64(combined),
       salt,
     }
   }
 
   decryptBackupData(encryptedData: string, password: string, salt: string): any {
     const derivedKey = this.deriveKeyFromPassword(password, salt)
-    const combined = sodium.from_hex(encryptedData)
-    const nonce = combined.slice(0, sodium.crypto_secretbox_NONCEBYTES)
-    const encrypted = combined.slice(sodium.crypto_secretbox_NONCEBYTES)
-    const keyBytes = sodium.from_hex(derivedKey)
+    const combined = decodeBase64(encryptedData)
+    const nonce = combined.slice(0, nacl.secretbox.nonceLength)
+    const encrypted = combined.slice(nacl.secretbox.nonceLength)
+    const keyBytes = decodeBase64(derivedKey)
 
-    const decrypted = sodium.crypto_secretbox_open_easy(encrypted, nonce, keyBytes)
-    return JSON.parse(sodium.to_string(decrypted))
+    const decrypted = nacl.secretbox.open(encrypted, nonce, keyBytes)
+    if (!decrypted) {
+      throw new Error("Decryption failed")
+    }
+    return JSON.parse(decodeUTF8(decrypted))
   }
 
   secureWipe(data: string): void {
