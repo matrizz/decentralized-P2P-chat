@@ -8,7 +8,7 @@ export interface NetworkMessage {
   content: string
   timestamp: number
   signature?: string
-  targetRecipient?: string // Added for better targeting
+  targetRecipient?: string
 }
 
 export interface PeerConnection {
@@ -29,9 +29,16 @@ export class P2PNetworkManager {
   private isNetworkOnline = true
   private broadcastChannel: BroadcastChannel | null = null
   private storageEventListener: ((event: StorageEvent) => void) | null = null
-  private readonly SIGNALING_SERVER = "wss://socketsbay.com/wss/v2/1/demo/"
+  private readonly SIGNALING_SERVERS = [
+    "wss://ws.postman-echo.com/raw",
+    "wss://echo.websocket.org",
+    "wss://ws.ifelse.io",
+  ]
+  private currentServerIndex = 0
   private reconnectAttempts = 0
-  private maxReconnectAttempts = 5
+  private maxReconnectAttempts = 3
+  private globalStorageKey = "p2p-global-network"
+  private messageQueueKey = "p2p-message-queue"
 
   private constructor() {
     if (typeof window !== "undefined") {
@@ -65,11 +72,13 @@ export class P2PNetworkManager {
       await this.connectToSignalingServer()
       this.setupCrossTabCommunication()
       this.setupPeerDiscovery()
+      this.setupGlobalStorage()
 
       this.isInitialized = true
       console.log("[v0] P2P network initialized successfully")
 
       await this.announcePresence()
+      this.processQueuedMessages()
 
       const status = this.getConnectionStatus()
       console.log("[v0] Network status after initialization:", status)
@@ -83,59 +92,70 @@ export class P2PNetworkManager {
   private async connectToSignalingServer(): Promise<void> {
     if (!this.isNetworkOnline || typeof window === "undefined") return
 
-    try {
-      console.log("[v0] Connecting to signaling server...")
-      this.signalingServer = new WebSocket(this.SIGNALING_SERVER)
+    for (let i = 0; i < this.SIGNALING_SERVERS.length; i++) {
+      const serverUrl = this.SIGNALING_SERVERS[this.currentServerIndex]
 
-      this.signalingServer.onopen = () => {
-        console.log("[v0] Connected to signaling server")
-        this.reconnectAttempts = 0
+      try {
+        console.log(`[v0] Connecting to signaling server: ${serverUrl}`)
+        this.signalingServer = new WebSocket(serverUrl)
+
+        await new Promise((resolve, reject) => {
+          if (!this.signalingServer) return reject(new Error("WebSocket not created"))
+
+          const timeout = setTimeout(() => reject(new Error("Connection timeout")), 3000)
+
+          this.signalingServer.onopen = () => {
+            clearTimeout(timeout)
+            console.log(`[v0] Connected to signaling server: ${serverUrl}`)
+            this.reconnectAttempts = 0
+            this.setupSignalingHandlers()
+            resolve(void 0)
+          }
+
+          this.signalingServer.onerror = () => {
+            clearTimeout(timeout)
+            reject(new Error("WebSocket connection failed"))
+          }
+        })
+
         if (this.currentUser) {
-          this.announcePresence()
+          await this.announcePresence()
         }
-      }
-
-      this.signalingServer.onmessage = (event) => {
-        try {
-          const data = JSON.parse(event.data)
-          console.log("[v0] Received signaling message:", data)
-          this.handleSignalingMessage(data)
-        } catch (error) {
-          console.error("[v0] Error parsing signaling message:", error)
-        }
-      }
-
-      this.signalingServer.onclose = () => {
-        console.log("[v0] Signaling server connection closed")
+        return
+      } catch (error) {
+        console.error(`[v0] Failed to connect to ${serverUrl}:`, error)
         this.signalingServer = null
-        this.scheduleReconnect()
-      }
 
-      this.signalingServer.onerror = (error) => {
-        console.error("[v0] Signaling server error:", error)
-      }
+        this.currentServerIndex = (this.currentServerIndex + 1) % this.SIGNALING_SERVERS.length
 
-      // Wait for connection to open
-      await new Promise((resolve, reject) => {
-        if (!this.signalingServer) return reject(new Error("WebSocket not created"))
-
-        const timeout = setTimeout(() => reject(new Error("Connection timeout")), 5000)
-
-        this.signalingServer.onopen = () => {
-          clearTimeout(timeout)
-          console.log("[v0] Connected to signaling server")
-          this.reconnectAttempts = 0
-          resolve(void 0)
+        if (i === this.SIGNALING_SERVERS.length - 1) {
+          throw new Error("All signaling servers failed")
         }
+      }
+    }
+  }
 
-        this.signalingServer.onerror = () => {
-          clearTimeout(timeout)
-          reject(new Error("WebSocket connection failed"))
-        }
-      })
-    } catch (error) {
-      console.error("[v0] Failed to connect to signaling server:", error)
-      throw error
+  private setupSignalingHandlers(): void {
+    if (!this.signalingServer) return
+
+    this.signalingServer.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        console.log("[v0] Received signaling message:", data)
+        this.handleSignalingMessage(data)
+      } catch (error) {
+        console.error("[v0] Error parsing signaling message:", error)
+      }
+    }
+
+    this.signalingServer.onclose = () => {
+      console.log("[v0] Signaling server connection closed")
+      this.signalingServer = null
+      this.scheduleReconnect()
+    }
+
+    this.signalingServer.onerror = (error) => {
+      console.error("[v0] Signaling server error:", error)
     }
   }
 
@@ -170,17 +190,18 @@ export class P2PNetworkManager {
 
   private scheduleReconnect(): void {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log("[v0] Max reconnection attempts reached, falling back to localStorage")
+      console.log("[v0] Max reconnection attempts reached, using global storage only")
       this.setupFallbackCommunication()
       return
     }
 
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000)
     this.reconnectAttempts++
 
     console.log(`[v0] Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`)
     setTimeout(() => {
       if (this.isNetworkOnline && this.isInitialized) {
+        this.currentServerIndex = (this.currentServerIndex + 1) % this.SIGNALING_SERVERS.length
         this.connectToSignalingServer().catch(() => {
           this.scheduleReconnect()
         })
@@ -188,44 +209,114 @@ export class P2PNetworkManager {
     }, delay)
   }
 
-  private setupFallbackCommunication(): void {
-    console.log("[v0] Setting up fallback localStorage communication")
-    this.setupCrossTabCommunication()
+  private setupGlobalStorage(): void {
+    if (typeof window === "undefined") return
 
-    // Use a simple HTTP-based signaling as fallback
-    this.setupHttpSignaling()
+    this.storeGlobalPresence()
+
+    setInterval(() => {
+      this.checkGlobalMessages()
+    }, 2000)
+
+    setInterval(() => {
+      this.cleanupGlobalStorage()
+    }, 10000)
   }
 
-  private setupHttpSignaling(): void {
-    const announceViaHttp = async () => {
-      if (!this.currentUser) return
+  private storeGlobalPresence(): void {
+    if (!this.currentUser || typeof window === "undefined") return
 
-      try {
-        // Use a simple public API for peer discovery
-        const response = await fetch("https://httpbin.org/post", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            type: "peer_announcement",
-            userId: this.currentUser.id,
-            userData: {
-              username: this.currentUser.username,
-              publicKey: this.currentUser.publicKey,
-              timestamp: Date.now(),
-            },
-          }),
-        })
+    try {
+      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
+      const now = Date.now()
 
-        if (response.ok) {
-          console.log("[v0] Announced presence via HTTP fallback")
-        }
-      } catch (error) {
-        console.log("[v0] HTTP fallback not available, using localStorage only")
+      globalData.users = globalData.users || {}
+      globalData.users[this.currentUser.id] = {
+        username: this.currentUser.username,
+        publicKey: this.currentUser.publicKey,
+        lastSeen: now,
+        isOnline: true,
       }
-    }
 
-    // Announce every 10 seconds via HTTP fallback
-    setInterval(announceViaHttp, 10000)
+      localStorage.setItem(this.globalStorageKey, JSON.stringify(globalData))
+      console.log("[v0] Stored global presence for:", this.currentUser.username)
+    } catch (error) {
+      console.error("[v0] Error storing global presence:", error)
+    }
+  }
+
+  private checkGlobalMessages(): void {
+    if (!this.currentUser || typeof window === "undefined") return
+
+    try {
+      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
+      const myMessages = messageQueue.filter(
+        (msg: any) =>
+          msg.recipientId === this.currentUser?.id && msg.senderId !== this.currentUser?.id && !msg.processed,
+      )
+
+      myMessages.forEach((message: any) => {
+        console.log("[v0] Processing queued message:", message)
+        this.handleIncomingMessage(message)
+        message.processed = true
+      })
+
+      if (myMessages.length > 0) {
+        localStorage.setItem(this.messageQueueKey, JSON.stringify(messageQueue))
+      }
+    } catch (error) {
+      console.error("[v0] Error checking global messages:", error)
+    }
+  }
+
+  private cleanupGlobalStorage(): void {
+    if (typeof window === "undefined") return
+
+    try {
+      const now = Date.now()
+      const maxAge = 60000
+
+      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
+      if (globalData.users) {
+        Object.keys(globalData.users).forEach((userId) => {
+          if (now - globalData.users[userId].lastSeen > maxAge) {
+            delete globalData.users[userId]
+            this.peers.delete(userId)
+            this.notifyPeerStatus(userId, false)
+          }
+        })
+        localStorage.setItem(this.globalStorageKey, JSON.stringify(globalData))
+      }
+
+      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
+      const cleanQueue = messageQueue.filter((msg: any) => now - msg.timestamp < maxAge || !msg.processed)
+      localStorage.setItem(this.messageQueueKey, JSON.stringify(cleanQueue))
+    } catch (error) {
+      console.error("[v0] Error cleaning up global storage:", error)
+    }
+  }
+
+  private processQueuedMessages(): void {
+    this.checkGlobalMessages()
+
+    try {
+      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
+      if (globalData.users) {
+        Object.entries(globalData.users).forEach(([userId, userData]: [string, any]) => {
+          if (userId !== this.currentUser?.id) {
+            this.handlePeerDiscovery(userId, userData)
+          }
+        })
+      }
+    } catch (error) {
+      console.error("[v0] Error processing queued messages:", error)
+    }
+  }
+
+  private setupFallbackCommunication(): void {
+    console.log("[v0] Setting up fallback global storage communication")
+    this.setupCrossTabCommunication()
+    this.setupGlobalStorage()
   }
 
   private setupCrossTabCommunication(): void {
@@ -308,6 +399,7 @@ export class P2PNetworkManager {
     setInterval(() => {
       if (this.isInitialized && this.currentUser) {
         this.announcePresence()
+        this.storeGlobalPresence()
       }
     }, 5000)
 
@@ -401,6 +493,18 @@ export class P2PNetworkManager {
       }
     }
 
+    try {
+      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
+      messageQueue.push({
+        ...message,
+        processed: false,
+      })
+      localStorage.setItem(this.messageQueueKey, JSON.stringify(messageQueue))
+      console.log("[v0] Message queued in global storage")
+    } catch (error) {
+      console.error("[v0] Failed to queue message:", error)
+    }
+
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
@@ -486,6 +590,7 @@ export class P2PNetworkManager {
 
     if (isOnline) {
       await this.announcePresence()
+      this.storeGlobalPresence()
     }
   }
 
@@ -554,6 +659,13 @@ export class P2PNetworkManager {
       this.broadcastChannel.postMessage(data)
     } else {
       localStorage.setItem("p2p-chat-messages", JSON.stringify(data))
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: "p2p-chat-messages",
+          newValue: JSON.stringify(data),
+          url: window.location.href,
+        }),
+      )
       setTimeout(() => {
         localStorage.removeItem("p2p-chat-messages")
       }, 100)
