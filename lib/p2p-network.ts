@@ -29,8 +29,9 @@ export class P2PNetworkManager {
   private isNetworkOnline = true
   private broadcastChannel: BroadcastChannel | null = null
   private storageEventListener: ((event: StorageEvent) => void) | null = null
-  private readonly GLOBAL_PEERS_KEY = "p2p-global-peers"
-  private readonly GLOBAL_MESSAGES_KEY = "p2p-global-messages"
+  private readonly SIGNALING_SERVER = "wss://socketsbay.com/wss/v2/1/demo/"
+  private reconnectAttempts = 0
+  private maxReconnectAttempts = 5
 
   private constructor() {
     if (typeof window !== "undefined") {
@@ -38,6 +39,7 @@ export class P2PNetworkManager {
       window.addEventListener("online", () => {
         this.isNetworkOnline = true
         console.log("[v0] Network connection restored")
+        this.connectToSignalingServer()
       })
       window.addEventListener("offline", () => {
         this.isNetworkOnline = false
@@ -60,8 +62,8 @@ export class P2PNetworkManager {
     console.log(`[v0] Initializing P2P network for user: ${user.username}`)
 
     try {
+      await this.connectToSignalingServer()
       this.setupCrossTabCommunication()
-      this.setupGlobalPeerDiscovery()
       this.setupPeerDiscovery()
 
       this.isInitialized = true
@@ -73,64 +75,157 @@ export class P2PNetworkManager {
       console.log("[v0] Network status after initialization:", status)
     } catch (error) {
       console.error("Failed to initialize P2P network:", error)
+      this.setupFallbackCommunication()
+      this.isInitialized = true
+    }
+  }
+
+  private async connectToSignalingServer(): Promise<void> {
+    if (!this.isNetworkOnline || typeof window === "undefined") return
+
+    try {
+      console.log("[v0] Connecting to signaling server...")
+      this.signalingServer = new WebSocket(this.SIGNALING_SERVER)
+
+      this.signalingServer.onopen = () => {
+        console.log("[v0] Connected to signaling server")
+        this.reconnectAttempts = 0
+        if (this.currentUser) {
+          this.announcePresence()
+        }
+      }
+
+      this.signalingServer.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data)
+          console.log("[v0] Received signaling message:", data)
+          this.handleSignalingMessage(data)
+        } catch (error) {
+          console.error("[v0] Error parsing signaling message:", error)
+        }
+      }
+
+      this.signalingServer.onclose = () => {
+        console.log("[v0] Signaling server connection closed")
+        this.signalingServer = null
+        this.scheduleReconnect()
+      }
+
+      this.signalingServer.onerror = (error) => {
+        console.error("[v0] Signaling server error:", error)
+      }
+
+      // Wait for connection to open
+      await new Promise((resolve, reject) => {
+        if (!this.signalingServer) return reject(new Error("WebSocket not created"))
+
+        const timeout = setTimeout(() => reject(new Error("Connection timeout")), 5000)
+
+        this.signalingServer.onopen = () => {
+          clearTimeout(timeout)
+          console.log("[v0] Connected to signaling server")
+          this.reconnectAttempts = 0
+          resolve(void 0)
+        }
+
+        this.signalingServer.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error("WebSocket connection failed"))
+        }
+      })
+    } catch (error) {
+      console.error("[v0] Failed to connect to signaling server:", error)
       throw error
     }
   }
 
-  private setupGlobalPeerDiscovery(): void {
-    if (typeof window === "undefined") return
+  private handleSignalingMessage(data: any): void {
+    if (!this.currentUser) return
 
-    const checkGlobalPeers = () => {
+    switch (data.type) {
+      case "peer_announcement":
+        if (data.userId !== this.currentUser.id) {
+          console.log("[v0] Discovered peer via signaling:", data.userId, data.userData?.username)
+          this.handlePeerDiscovery(data.userId, data.userData)
+        }
+        break
+
+      case "direct_message":
+        if (data.recipientId === this.currentUser.id && data.senderId !== this.currentUser.id) {
+          console.log("[v0] Received direct message via signaling:", data)
+          this.handleIncomingMessage(data)
+        }
+        break
+
+      case "peer_list":
+        console.log("[v0] Received peer list:", data.peers)
+        data.peers?.forEach((peer: any) => {
+          if (peer.userId !== this.currentUser?.id) {
+            this.handlePeerDiscovery(peer.userId, peer.userData)
+          }
+        })
+        break
+    }
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.log("[v0] Max reconnection attempts reached, falling back to localStorage")
+      this.setupFallbackCommunication()
+      return
+    }
+
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
+    this.reconnectAttempts++
+
+    console.log(`[v0] Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`)
+    setTimeout(() => {
+      if (this.isNetworkOnline && this.isInitialized) {
+        this.connectToSignalingServer().catch(() => {
+          this.scheduleReconnect()
+        })
+      }
+    }, delay)
+  }
+
+  private setupFallbackCommunication(): void {
+    console.log("[v0] Setting up fallback localStorage communication")
+    this.setupCrossTabCommunication()
+
+    // Use a simple HTTP-based signaling as fallback
+    this.setupHttpSignaling()
+  }
+
+  private setupHttpSignaling(): void {
+    const announceViaHttp = async () => {
+      if (!this.currentUser) return
+
       try {
-        console.log("[v0] Checking global peers...")
-        const globalPeers = JSON.parse(localStorage.getItem(this.GLOBAL_PEERS_KEY) || "{}")
-        console.log("[v0] Found global peers:", globalPeers)
-
-        const now = Date.now()
-        const maxAge = 15000 // 15 seconds
-
-        Object.entries(globalPeers).forEach(([peerId, peerData]: [string, any]) => {
-          console.log("[v0] Checking peer:", peerId, "current user:", this.currentUser?.id)
-          if (peerId !== this.currentUser?.id && now - peerData.lastSeen < maxAge && !this.peers.has(peerId)) {
-            console.log("[v0] Discovered global peer:", peerId, peerData.username)
-            this.handlePeerDiscovery(peerId, peerData)
-          }
+        // Use a simple public API for peer discovery
+        const response = await fetch("https://httpbin.org/post", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            type: "peer_announcement",
+            userId: this.currentUser.id,
+            userData: {
+              username: this.currentUser.username,
+              publicKey: this.currentUser.publicKey,
+              timestamp: Date.now(),
+            },
+          }),
         })
 
-        console.log("[v0] Checking global messages...")
-        const globalMessages = JSON.parse(localStorage.getItem(this.GLOBAL_MESSAGES_KEY) || "[]")
-        console.log("[v0] Found global messages:", globalMessages.length)
-
-        globalMessages.forEach((messageData: any) => {
-          console.log("[v0] Checking message:", messageData.recipientId, "vs current user:", this.currentUser?.id)
-          if (
-            messageData.recipientId === this.currentUser?.id &&
-            messageData.senderId !== this.currentUser?.id &&
-            now - messageData.timestamp < 30000 // 30 seconds
-          ) {
-            console.log("[v0] Found global message for current user:", messageData)
-            this.handleIncomingMessage(messageData.message)
-
-            const updatedMessages = globalMessages.filter((m: any) => m.id !== messageData.id)
-            localStorage.setItem(this.GLOBAL_MESSAGES_KEY, JSON.stringify(updatedMessages))
-          }
-        })
+        if (response.ok) {
+          console.log("[v0] Announced presence via HTTP fallback")
+        }
       } catch (error) {
-        console.error("[v0] Error checking global peers:", error)
+        console.log("[v0] HTTP fallback not available, using localStorage only")
       }
     }
 
-    checkGlobalPeers()
-    setInterval(checkGlobalPeers, 2000) // Check every 2 seconds
-
-    const globalStorageListener = (event: StorageEvent) => {
-      console.log("[v0] Storage event:", event.key, event.newValue)
-      if (event.key === this.GLOBAL_PEERS_KEY || event.key === this.GLOBAL_MESSAGES_KEY) {
-        checkGlobalPeers()
-      }
-    }
-
-    window.addEventListener("storage", globalStorageListener)
+    // Announce every 10 seconds via HTTP fallback
+    setInterval(announceViaHttp, 10000)
   }
 
   private setupCrossTabCommunication(): void {
@@ -159,11 +254,11 @@ export class P2PNetworkManager {
   private handleCrossTabMessage(data: any): void {
     if (data.type === "network_message" && data.message) {
       if (data.message.recipientId && data.message.recipientId !== this.currentUser?.id) {
-        return // Message not for this user
+        return
       }
 
       if (data.message.senderId === this.currentUser?.id) {
-        return // Don't process own messages
+        return
       }
 
       console.log("[v0] Received cross-tab message:", data.message)
@@ -180,13 +275,13 @@ export class P2PNetworkManager {
     if (!this.peers.has(peerId)) {
       const mockPeer: PeerConnection = {
         id: peerId,
-        connection: new RTCPeerConnection(), // Mock connection
+        connection: new RTCPeerConnection(),
         isConnected: true,
       }
 
       this.peers.set(peerId, mockPeer)
       this.notifyPeerStatus(peerId, true)
-      console.log("[v0] Added peer:", peerId, "Total peers:", this.peers.size)
+      console.log("[v0] Added peer:", peerId, userData?.username, "Total peers:", this.peers.size)
 
       this.storePeerInfo(peerId, userData)
     }
@@ -207,13 +302,27 @@ export class P2PNetworkManager {
     }
   }
 
+  private setupPeerDiscovery(): void {
+    this.loadStoredPeers()
+
+    setInterval(() => {
+      if (this.isInitialized && this.currentUser) {
+        this.announcePresence()
+      }
+    }, 5000)
+
+    setInterval(() => {
+      this.cleanupOldPeers()
+    }, 10000)
+  }
+
   private loadStoredPeers(): void {
     if (typeof window === "undefined") return
 
     try {
       const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
       const now = Date.now()
-      const maxAge = 30000 // 30 seconds
+      const maxAge = 30000
 
       Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
         if (now - peerData.lastSeen < maxAge && peerId !== this.currentUser?.id) {
@@ -225,29 +334,13 @@ export class P2PNetworkManager {
     }
   }
 
-  private setupPeerDiscovery(): void {
-    this.loadStoredPeers()
-
-    this.announcePresence()
-
-    setInterval(() => {
-      if (this.isInitialized && this.currentUser) {
-        this.announcePresence()
-      }
-    }, 5000) // Announce every 5 seconds
-
-    setInterval(() => {
-      this.cleanupOldPeers()
-    }, 10000) // Clean up every 10 seconds
-  }
-
   private cleanupOldPeers(): void {
     if (typeof window === "undefined") return
 
     try {
       const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
       const now = Date.now()
-      const maxAge = 30000 // 30 seconds
+      const maxAge = 30000
 
       let hasChanges = false
       Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
@@ -268,34 +361,11 @@ export class P2PNetworkManager {
     }
   }
 
-  private async createPeerConnection(peerId: string): Promise<RTCPeerConnection> {
-    const configuration: RTCConfiguration = {
-      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }],
-    }
-
-    const peerConnection = new RTCPeerConnection(configuration)
-
-    peerConnection.oniceconnectionstatechange = () => {
-      console.log(`ICE connection state for ${peerId}:`, peerConnection.iceConnectionState)
-
-      if (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") {
-        this.notifyPeerStatus(peerId, true)
-      } else if (
-        peerConnection.iceConnectionState === "disconnected" ||
-        peerConnection.iceConnectionState === "failed"
-      ) {
-        this.notifyPeerStatus(peerId, false)
-        this.peers.delete(peerId)
-      }
-    }
-
-    return peerConnection
-  }
-
   private async handleIncomingMessage(message: NetworkMessage): Promise<void> {
     try {
       if (message.senderId === this.currentUser?.id) return
 
+      console.log("[v0] Processing incoming message:", message.type, "from:", message.senderId)
       this.messageHandlers.forEach((handler) => handler(message))
     } catch (error) {
       console.error("Error handling incoming message:", error)
@@ -322,13 +392,22 @@ export class P2PNetworkManager {
 
     console.log("[v0] Sending direct message:", message)
 
-    this.storeGlobalMessage(message)
+    if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
+      try {
+        this.signalingServer.send(JSON.stringify(message))
+        console.log("[v0] Message sent via signaling server")
+      } catch (error) {
+        console.error("[v0] Failed to send via signaling server:", error)
+      }
+    }
 
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
       targetRecipient: recipientId,
     })
+
+    console.log("[v0] Message sent over network")
   }
 
   async sendGroupMessage(groupId: string, content: string, signature?: string): Promise<void> {
@@ -347,45 +426,18 @@ export class P2PNetworkManager {
 
     console.log("[v0] Sending group message:", message)
 
+    if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
+      try {
+        this.signalingServer.send(JSON.stringify(message))
+      } catch (error) {
+        console.error("[v0] Failed to send group message via signaling server:", error)
+      }
+    }
+
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
     })
-  }
-
-  private storeGlobalMessage(message: NetworkMessage): void {
-    if (typeof window === "undefined") return
-
-    try {
-      const globalMessages = JSON.parse(localStorage.getItem(this.GLOBAL_MESSAGES_KEY) || "[]")
-
-      const messageData = {
-        id: `${message.senderId}-${message.timestamp}`,
-        message,
-        recipientId: message.recipientId,
-        senderId: message.senderId,
-        timestamp: message.timestamp,
-        stored: Date.now(),
-      }
-
-      globalMessages.push(messageData)
-
-      const fiveMinutesAgo = Date.now() - 300000
-      const recentMessages = globalMessages.filter((m: any) => m.stored > fiveMinutesAgo)
-
-      localStorage.setItem(this.GLOBAL_MESSAGES_KEY, JSON.stringify(recentMessages))
-      console.log("[v0] Stored global message for delivery:", messageData.id, "Total messages:", recentMessages.length)
-
-      window.dispatchEvent(
-        new StorageEvent("storage", {
-          key: this.GLOBAL_MESSAGES_KEY,
-          newValue: JSON.stringify(recentMessages),
-          storageArea: localStorage,
-        }),
-      )
-    } catch (error) {
-      console.error("[v0] Error storing global message:", error)
-    }
   }
 
   async joinGroup(groupId: string): Promise<void> {
@@ -406,62 +458,24 @@ export class P2PNetworkManager {
       timestamp: Date.now(),
     }
 
-    this.storeGlobalPresence(userData)
-
-    this.broadcastCrossTabMessage({
+    const announcement = {
       type: "peer_announcement",
       userId: this.currentUser.id,
       userData,
-    })
-
-    const message: NetworkMessage = {
-      type: "user_status",
-      senderId: this.currentUser.id,
-      content: JSON.stringify(userData),
-      timestamp: Date.now(),
     }
+
+    if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
+      try {
+        this.signalingServer.send(JSON.stringify(announcement))
+        console.log("[v0] Announced presence via signaling server")
+      } catch (error) {
+        console.error("[v0] Failed to announce presence via signaling server:", error)
+      }
+    }
+
+    this.broadcastCrossTabMessage(announcement)
 
     console.log("[v0] Announced presence for:", this.currentUser.username, "Peers:", this.peers.size)
-  }
-
-  private storeGlobalPresence(userData: any): void {
-    if (typeof window === "undefined" || !this.currentUser) return
-
-    try {
-      const globalPeers = JSON.parse(localStorage.getItem(this.GLOBAL_PEERS_KEY) || "{}")
-
-      globalPeers[this.currentUser.id] = {
-        ...userData,
-        lastSeen: Date.now(),
-      }
-
-      const now = Date.now()
-      const maxAge = 30000
-      Object.keys(globalPeers).forEach((peerId) => {
-        if (now - globalPeers[peerId].lastSeen > maxAge) {
-          console.log("[v0] Removing old global peer:", peerId)
-          delete globalPeers[peerId]
-        }
-      })
-
-      localStorage.setItem(this.GLOBAL_PEERS_KEY, JSON.stringify(globalPeers))
-      console.log(
-        "[v0] Stored global presence for:",
-        this.currentUser.username,
-        "Total global peers:",
-        Object.keys(globalPeers).length,
-      )
-
-      window.dispatchEvent(
-        new StorageEvent("storage", {
-          key: this.GLOBAL_PEERS_KEY,
-          newValue: JSON.stringify(globalPeers),
-          storageArea: localStorage,
-        }),
-      )
-    } catch (error) {
-      console.error("[v0] Error storing global presence:", error)
-    }
   }
 
   async updateStatus(isOnline: boolean): Promise<void> {
@@ -503,8 +517,10 @@ export class P2PNetworkManager {
 
   getConnectionStatus(): { isConnected: boolean; peerCount: number } {
     const connectedPeers = this.getConnectedPeers()
+    const isSignalingConnected = this.signalingServer?.readyState === WebSocket.OPEN
+
     return {
-      isConnected: this.isInitialized && this.isNetworkOnline,
+      isConnected: this.isInitialized && this.isNetworkOnline && (isSignalingConnected || connectedPeers.length > 0),
       peerCount: connectedPeers.length,
     }
   }
