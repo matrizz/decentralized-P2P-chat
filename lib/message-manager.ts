@@ -37,6 +37,8 @@ export class MessageManager {
   private async handleNetworkMessage(networkMessage: NetworkMessage): Promise<void> {
     try {
       console.log("[v0] Handling network message:", networkMessage)
+      console.log("[v0] Current user ID:", this.currentUser?.id)
+      console.log("[v0] Message recipient ID:", networkMessage.recipientId)
 
       let decryptedContent: string
       let message: Message
@@ -44,10 +46,16 @@ export class MessageManager {
       if (networkMessage.type === "direct_message") {
         console.log("[v0] Processing direct message from:", networkMessage.senderId)
 
+        if (networkMessage.recipientId !== this.currentUser?.id) {
+          console.log("[v0] Message not for current user, ignoring")
+          return
+        }
+
         // Decrypt direct message
         const contact = await this.storage.getContact(networkMessage.senderId)
         if (!contact) {
           console.warn("[v0] Received message from unknown contact:", networkMessage.senderId)
+          console.log("[v0] Available contacts:", await this.storage.getAllContacts())
           return
         }
 
@@ -112,6 +120,7 @@ export class MessageManager {
         await this.handleUserStatusUpdate(networkMessage.senderId, statusData)
         return
       } else {
+        console.log("[v0] Unknown message type:", networkMessage.type)
         return
       }
 
@@ -120,6 +129,7 @@ export class MessageManager {
       console.log("[v0] Saved message to storage:", message.id)
 
       // Notify listeners
+      console.log("[v0] Notifying", this.messageListeners.length, "message listeners")
       this.messageListeners.forEach((listener) => listener(message))
       console.log("[v0] Notified message listeners")
     } catch (error) {
@@ -143,11 +153,13 @@ export class MessageManager {
     }
 
     console.log("[v0] Sending direct message to:", recipientId, "content:", content)
+    console.log("[v0] Current user:", this.currentUser.id)
 
     // Get recipient's public key
     const contact = await this.storage.getContact(recipientId)
     if (!contact) {
       console.error("[v0] Contact not found:", recipientId)
+      console.log("[v0] Available contacts:", await this.storage.getAllContacts())
       throw new Error("Contact not found")
     }
 
@@ -180,6 +192,9 @@ export class MessageManager {
     // Send over network
     await this.network.sendDirectMessage(recipientId, encryptedContent)
     console.log("[v0] Message sent over network")
+
+    const networkStatus = this.network.getConnectionStatus()
+    console.log("[v0] Network status after sending:", networkStatus)
 
     return message
   }

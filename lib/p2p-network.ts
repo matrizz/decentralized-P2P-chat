@@ -8,6 +8,7 @@ export interface NetworkMessage {
   content: string
   timestamp: number
   signature?: string
+  targetRecipient?: string // Added for better targeting
 }
 
 export interface PeerConnection {
@@ -98,7 +99,13 @@ export class P2PNetworkManager {
 
   private handleCrossTabMessage(data: any): void {
     if (data.type === "network_message" && data.message) {
-      if (data.message.senderId === this.currentUser?.id) return
+      if (data.message.recipientId && data.message.recipientId !== this.currentUser?.id) {
+        return // Message not for this user
+      }
+
+      if (data.message.senderId === this.currentUser?.id) {
+        return // Don't process own messages
+      }
 
       console.log("[v0] Received cross-tab message:", data.message)
       this.handleIncomingMessage(data.message)
@@ -120,11 +127,48 @@ export class P2PNetworkManager {
 
       this.peers.set(peerId, mockPeer)
       this.notifyPeerStatus(peerId, true)
-      console.log("[v0] Added peer:", peerId)
+      console.log("[v0] Added peer:", peerId, "Total peers:", this.peers.size)
+
+      this.storePeerInfo(peerId, userData)
+    }
+  }
+
+  private storePeerInfo(peerId: string, userData: any): void {
+    if (typeof window === "undefined") return
+
+    try {
+      const existingPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
+      existingPeers[peerId] = {
+        ...userData,
+        lastSeen: Date.now(),
+      }
+      localStorage.setItem("p2p-discovered-peers", JSON.stringify(existingPeers))
+    } catch (error) {
+      console.error("Error storing peer info:", error)
+    }
+  }
+
+  private loadStoredPeers(): void {
+    if (typeof window === "undefined") return
+
+    try {
+      const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
+      const now = Date.now()
+      const maxAge = 30000 // 30 seconds
+
+      Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
+        if (now - peerData.lastSeen < maxAge && peerId !== this.currentUser?.id) {
+          this.handlePeerDiscovery(peerId, peerData)
+        }
+      })
+    } catch (error) {
+      console.error("Error loading stored peers:", error)
     }
   }
 
   private setupPeerDiscovery(): void {
+    this.loadStoredPeers()
+
     this.announcePresence()
 
     setInterval(() => {
@@ -132,6 +176,37 @@ export class P2PNetworkManager {
         this.announcePresence()
       }
     }, 5000) // Announce every 5 seconds
+
+    setInterval(() => {
+      this.cleanupOldPeers()
+    }, 10000) // Clean up every 10 seconds
+  }
+
+  private cleanupOldPeers(): void {
+    if (typeof window === "undefined") return
+
+    try {
+      const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
+      const now = Date.now()
+      const maxAge = 30000 // 30 seconds
+
+      let hasChanges = false
+      Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
+        if (now - peerData.lastSeen > maxAge) {
+          delete storedPeers[peerId]
+          this.peers.delete(peerId)
+          this.notifyPeerStatus(peerId, false)
+          hasChanges = true
+          console.log("[v0] Removed old peer:", peerId)
+        }
+      })
+
+      if (hasChanges) {
+        localStorage.setItem("p2p-discovered-peers", JSON.stringify(storedPeers))
+      }
+    } catch (error) {
+      console.error("Error cleaning up old peers:", error)
+    }
   }
 
   private async createPeerConnection(peerId: string): Promise<RTCPeerConnection> {
@@ -191,6 +266,7 @@ export class P2PNetworkManager {
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
+      targetRecipient: recipientId, // Add target info for better routing
     })
   }
 
@@ -242,6 +318,7 @@ export class P2PNetworkManager {
       username: this.currentUser.username,
       publicKey: this.currentUser.publicKey,
       isOnline: true,
+      timestamp: Date.now(), // Added timestamp for freshness
     }
 
     this.broadcastCrossTabMessage({
@@ -257,7 +334,7 @@ export class P2PNetworkManager {
       timestamp: Date.now(),
     }
 
-    console.log("[v0] Announced presence for:", this.currentUser.username)
+    console.log("[v0] Announced presence for:", this.currentUser.username, "Peers:", this.peers.size)
   }
 
   async updateStatus(isOnline: boolean): Promise<void> {
