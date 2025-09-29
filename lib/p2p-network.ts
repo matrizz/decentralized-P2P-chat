@@ -82,19 +82,27 @@ export class P2PNetworkManager {
 
     const checkGlobalPeers = () => {
       try {
+        console.log("[v0] Checking global peers...")
         const globalPeers = JSON.parse(localStorage.getItem(this.GLOBAL_PEERS_KEY) || "{}")
+        console.log("[v0] Found global peers:", globalPeers)
+
         const now = Date.now()
         const maxAge = 15000 // 15 seconds
 
         Object.entries(globalPeers).forEach(([peerId, peerData]: [string, any]) => {
+          console.log("[v0] Checking peer:", peerId, "current user:", this.currentUser?.id)
           if (peerId !== this.currentUser?.id && now - peerData.lastSeen < maxAge && !this.peers.has(peerId)) {
             console.log("[v0] Discovered global peer:", peerId, peerData.username)
             this.handlePeerDiscovery(peerId, peerData)
           }
         })
 
+        console.log("[v0] Checking global messages...")
         const globalMessages = JSON.parse(localStorage.getItem(this.GLOBAL_MESSAGES_KEY) || "[]")
+        console.log("[v0] Found global messages:", globalMessages.length)
+
         globalMessages.forEach((messageData: any) => {
+          console.log("[v0] Checking message:", messageData.recipientId, "vs current user:", this.currentUser?.id)
           if (
             messageData.recipientId === this.currentUser?.id &&
             messageData.senderId !== this.currentUser?.id &&
@@ -116,6 +124,7 @@ export class P2PNetworkManager {
     setInterval(checkGlobalPeers, 2000) // Check every 2 seconds
 
     const globalStorageListener = (event: StorageEvent) => {
+      console.log("[v0] Storage event:", event.key, event.newValue)
       if (event.key === this.GLOBAL_PEERS_KEY || event.key === this.GLOBAL_MESSAGES_KEY) {
         checkGlobalPeers()
       }
@@ -365,7 +374,15 @@ export class P2PNetworkManager {
       const recentMessages = globalMessages.filter((m: any) => m.stored > fiveMinutesAgo)
 
       localStorage.setItem(this.GLOBAL_MESSAGES_KEY, JSON.stringify(recentMessages))
-      console.log("[v0] Stored global message for delivery:", messageData.id)
+      console.log("[v0] Stored global message for delivery:", messageData.id, "Total messages:", recentMessages.length)
+
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: this.GLOBAL_MESSAGES_KEY,
+          newValue: JSON.stringify(recentMessages),
+          storageArea: localStorage,
+        }),
+      )
     } catch (error) {
       console.error("[v0] Error storing global message:", error)
     }
@@ -422,12 +439,26 @@ export class P2PNetworkManager {
       const maxAge = 30000
       Object.keys(globalPeers).forEach((peerId) => {
         if (now - globalPeers[peerId].lastSeen > maxAge) {
+          console.log("[v0] Removing old global peer:", peerId)
           delete globalPeers[peerId]
         }
       })
 
       localStorage.setItem(this.GLOBAL_PEERS_KEY, JSON.stringify(globalPeers))
-      console.log("[v0] Stored global presence for:", this.currentUser.username)
+      console.log(
+        "[v0] Stored global presence for:",
+        this.currentUser.username,
+        "Total global peers:",
+        Object.keys(globalPeers).length,
+      )
+
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: this.GLOBAL_PEERS_KEY,
+          newValue: JSON.stringify(globalPeers),
+          storageArea: localStorage,
+        }),
+      )
     } catch (error) {
       console.error("[v0] Error storing global presence:", error)
     }
