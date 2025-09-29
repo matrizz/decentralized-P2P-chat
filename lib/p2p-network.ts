@@ -29,6 +29,8 @@ export class P2PNetworkManager {
   private isNetworkOnline = true
   private broadcastChannel: BroadcastChannel | null = null
   private storageEventListener: ((event: StorageEvent) => void) | null = null
+  private readonly GLOBAL_PEERS_KEY = "p2p-global-peers"
+  private readonly GLOBAL_MESSAGES_KEY = "p2p-global-messages"
 
   private constructor() {
     if (typeof window !== "undefined") {
@@ -59,6 +61,7 @@ export class P2PNetworkManager {
 
     try {
       this.setupCrossTabCommunication()
+      this.setupGlobalPeerDiscovery()
       this.setupPeerDiscovery()
 
       this.isInitialized = true
@@ -72,6 +75,53 @@ export class P2PNetworkManager {
       console.error("Failed to initialize P2P network:", error)
       throw error
     }
+  }
+
+  private setupGlobalPeerDiscovery(): void {
+    if (typeof window === "undefined") return
+
+    const checkGlobalPeers = () => {
+      try {
+        const globalPeers = JSON.parse(localStorage.getItem(this.GLOBAL_PEERS_KEY) || "{}")
+        const now = Date.now()
+        const maxAge = 15000 // 15 seconds
+
+        Object.entries(globalPeers).forEach(([peerId, peerData]: [string, any]) => {
+          if (peerId !== this.currentUser?.id && now - peerData.lastSeen < maxAge && !this.peers.has(peerId)) {
+            console.log("[v0] Discovered global peer:", peerId, peerData.username)
+            this.handlePeerDiscovery(peerId, peerData)
+          }
+        })
+
+        const globalMessages = JSON.parse(localStorage.getItem(this.GLOBAL_MESSAGES_KEY) || "[]")
+        globalMessages.forEach((messageData: any) => {
+          if (
+            messageData.recipientId === this.currentUser?.id &&
+            messageData.senderId !== this.currentUser?.id &&
+            now - messageData.timestamp < 30000 // 30 seconds
+          ) {
+            console.log("[v0] Found global message for current user:", messageData)
+            this.handleIncomingMessage(messageData.message)
+
+            const updatedMessages = globalMessages.filter((m: any) => m.id !== messageData.id)
+            localStorage.setItem(this.GLOBAL_MESSAGES_KEY, JSON.stringify(updatedMessages))
+          }
+        })
+      } catch (error) {
+        console.error("[v0] Error checking global peers:", error)
+      }
+    }
+
+    checkGlobalPeers()
+    setInterval(checkGlobalPeers, 2000) // Check every 2 seconds
+
+    const globalStorageListener = (event: StorageEvent) => {
+      if (event.key === this.GLOBAL_PEERS_KEY || event.key === this.GLOBAL_MESSAGES_KEY) {
+        checkGlobalPeers()
+      }
+    }
+
+    window.addEventListener("storage", globalStorageListener)
   }
 
   private setupCrossTabCommunication(): void {
@@ -263,10 +313,12 @@ export class P2PNetworkManager {
 
     console.log("[v0] Sending direct message:", message)
 
+    this.storeGlobalMessage(message)
+
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
-      targetRecipient: recipientId, // Add target info for better routing
+      targetRecipient: recipientId,
     })
   }
 
@@ -292,14 +344,30 @@ export class P2PNetworkManager {
     })
   }
 
-  private broadcastCrossTabMessage(data: any): void {
-    if (this.broadcastChannel) {
-      this.broadcastChannel.postMessage(data)
-    } else {
-      localStorage.setItem("p2p-chat-messages", JSON.stringify(data))
-      setTimeout(() => {
-        localStorage.removeItem("p2p-chat-messages")
-      }, 100)
+  private storeGlobalMessage(message: NetworkMessage): void {
+    if (typeof window === "undefined") return
+
+    try {
+      const globalMessages = JSON.parse(localStorage.getItem(this.GLOBAL_MESSAGES_KEY) || "[]")
+
+      const messageData = {
+        id: `${message.senderId}-${message.timestamp}`,
+        message,
+        recipientId: message.recipientId,
+        senderId: message.senderId,
+        timestamp: message.timestamp,
+        stored: Date.now(),
+      }
+
+      globalMessages.push(messageData)
+
+      const fiveMinutesAgo = Date.now() - 300000
+      const recentMessages = globalMessages.filter((m: any) => m.stored > fiveMinutesAgo)
+
+      localStorage.setItem(this.GLOBAL_MESSAGES_KEY, JSON.stringify(recentMessages))
+      console.log("[v0] Stored global message for delivery:", messageData.id)
+    } catch (error) {
+      console.error("[v0] Error storing global message:", error)
     }
   }
 
@@ -318,8 +386,10 @@ export class P2PNetworkManager {
       username: this.currentUser.username,
       publicKey: this.currentUser.publicKey,
       isOnline: true,
-      timestamp: Date.now(), // Added timestamp for freshness
+      timestamp: Date.now(),
     }
+
+    this.storeGlobalPresence(userData)
 
     this.broadcastCrossTabMessage({
       type: "peer_announcement",
@@ -335,6 +405,32 @@ export class P2PNetworkManager {
     }
 
     console.log("[v0] Announced presence for:", this.currentUser.username, "Peers:", this.peers.size)
+  }
+
+  private storeGlobalPresence(userData: any): void {
+    if (typeof window === "undefined" || !this.currentUser) return
+
+    try {
+      const globalPeers = JSON.parse(localStorage.getItem(this.GLOBAL_PEERS_KEY) || "{}")
+
+      globalPeers[this.currentUser.id] = {
+        ...userData,
+        lastSeen: Date.now(),
+      }
+
+      const now = Date.now()
+      const maxAge = 30000
+      Object.keys(globalPeers).forEach((peerId) => {
+        if (now - globalPeers[peerId].lastSeen > maxAge) {
+          delete globalPeers[peerId]
+        }
+      })
+
+      localStorage.setItem(this.GLOBAL_PEERS_KEY, JSON.stringify(globalPeers))
+      console.log("[v0] Stored global presence for:", this.currentUser.username)
+    } catch (error) {
+      console.error("[v0] Error storing global presence:", error)
+    }
   }
 
   async updateStatus(isOnline: boolean): Promise<void> {
@@ -404,5 +500,16 @@ export class P2PNetworkManager {
     }
 
     this.isInitialized = false
+  }
+
+  private broadcastCrossTabMessage(data: any): void {
+    if (this.broadcastChannel) {
+      this.broadcastChannel.postMessage(data)
+    } else {
+      localStorage.setItem("p2p-chat-messages", JSON.stringify(data))
+      setTimeout(() => {
+        localStorage.removeItem("p2p-chat-messages")
+      }, 100)
+    }
   }
 }
