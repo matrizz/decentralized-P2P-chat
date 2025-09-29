@@ -29,16 +29,23 @@ export class P2PNetworkManager {
   private isNetworkOnline = true
   private broadcastChannel: BroadcastChannel | null = null
   private storageEventListener: ((event: StorageEvent) => void) | null = null
-  private readonly SIGNALING_SERVERS = [
-    "wss://ws.postman-echo.com/raw",
-    "wss://echo.websocket.org",
-    "wss://ws.ifelse.io",
-  ]
-  private currentServerIndex = 0
+
+  private readonly SIGNALING_SERVER = "wss://socketio-chat-h9jt.herokuapp.com/socket.io/?EIO=4&transport=websocket"
   private reconnectAttempts = 0
-  private maxReconnectAttempts = 3
-  private globalStorageKey = "p2p-global-network"
-  private messageQueueKey = "p2p-message-queue"
+  private maxReconnectAttempts = 5
+  private pendingOffers: Map<string, RTCSessionDescriptionInit> = new Map()
+  private pendingAnswers: Map<string, RTCSessionDescriptionInit> = new Map()
+  private pendingCandidates: Map<string, RTCIceCandidate[]> = new Map()
+
+  private rtcConfig: RTCConfiguration = {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+      { urls: "stun:stun.stunprotocol.org:3478" },
+    ],
+    iceCandidatePoolSize: 10,
+  }
 
   private constructor() {
     if (typeof window !== "undefined") {
@@ -66,24 +73,19 @@ export class P2PNetworkManager {
     if (this.isInitialized || typeof window === "undefined") return
 
     this.currentUser = user
-    console.log(`[v0] Initializing P2P network for user: ${user.username}`)
+    console.log(`[v0] Initializing real WebRTC P2P network for user: ${user.username}`)
 
     try {
       await this.connectToSignalingServer()
       this.setupCrossTabCommunication()
-      this.setupPeerDiscovery()
-      this.setupGlobalStorage()
-
       this.isInitialized = true
-      console.log("[v0] P2P network initialized successfully")
+      console.log("[v0] WebRTC P2P network initialized successfully")
 
       await this.announcePresence()
-      this.processQueuedMessages()
-
       const status = this.getConnectionStatus()
       console.log("[v0] Network status after initialization:", status)
     } catch (error) {
-      console.error("Failed to initialize P2P network:", error)
+      console.error("Failed to initialize WebRTC P2P network:", error)
       this.setupFallbackCommunication()
       this.isInitialized = true
     }
@@ -92,57 +94,49 @@ export class P2PNetworkManager {
   private async connectToSignalingServer(): Promise<void> {
     if (!this.isNetworkOnline || typeof window === "undefined") return
 
-    for (let i = 0; i < this.SIGNALING_SERVERS.length; i++) {
-      const serverUrl = this.SIGNALING_SERVERS[this.currentServerIndex]
+    try {
+      console.log(`[v0] Connecting to WebRTC signaling server...`)
+      this.signalingServer = new WebSocket(this.SIGNALING_SERVER)
 
-      try {
-        console.log(`[v0] Connecting to signaling server: ${serverUrl}`)
-        this.signalingServer = new WebSocket(serverUrl)
+      await new Promise((resolve, reject) => {
+        if (!this.signalingServer) return reject(new Error("WebSocket not created"))
 
-        await new Promise((resolve, reject) => {
-          if (!this.signalingServer) return reject(new Error("WebSocket not created"))
+        const timeout = setTimeout(() => reject(new Error("Connection timeout")), 10000)
 
-          const timeout = setTimeout(() => reject(new Error("Connection timeout")), 3000)
-
-          this.signalingServer.onopen = () => {
-            clearTimeout(timeout)
-            console.log(`[v0] Connected to signaling server: ${serverUrl}`)
-            this.reconnectAttempts = 0
-            this.setupSignalingHandlers()
-            resolve(void 0)
-          }
-
-          this.signalingServer.onerror = () => {
-            clearTimeout(timeout)
-            reject(new Error("WebSocket connection failed"))
-          }
-        })
-
-        if (this.currentUser) {
-          await this.announcePresence()
+        this.signalingServer.onopen = () => {
+          clearTimeout(timeout)
+          console.log(`[v0] Connected to WebRTC signaling server`)
+          this.reconnectAttempts = 0
+          this.setupSignalingHandlers()
+          resolve(void 0)
         }
-        return
-      } catch (error) {
-        console.error(`[v0] Failed to connect to ${serverUrl}:`, error)
-        this.signalingServer = null
 
-        this.currentServerIndex = (this.currentServerIndex + 1) % this.SIGNALING_SERVERS.length
-
-        if (i === this.SIGNALING_SERVERS.length - 1) {
-          throw new Error("All signaling servers failed")
+        this.signalingServer.onerror = (error) => {
+          clearTimeout(timeout)
+          console.error("[v0] WebSocket connection error:", error)
+          reject(new Error("WebSocket connection failed"))
         }
+      })
+
+      if (this.currentUser) {
+        await this.announcePresence()
       }
+    } catch (error) {
+      console.error(`[v0] Failed to connect to signaling server:`, error)
+      this.signalingServer = null
+      this.scheduleReconnect()
+      throw error
     }
   }
 
   private setupSignalingHandlers(): void {
     if (!this.signalingServer) return
 
-    this.signalingServer.onmessage = (event) => {
+    this.signalingServer.onmessage = async (event) => {
       try {
         const data = JSON.parse(event.data)
-        console.log("[v0] Received signaling message:", data)
-        this.handleSignalingMessage(data)
+        console.log("[v0] Received signaling message:", data.type, data)
+        await this.handleSignalingMessage(data)
       } catch (error) {
         console.error("[v0] Error parsing signaling message:", error)
       }
@@ -159,14 +153,44 @@ export class P2PNetworkManager {
     }
   }
 
-  private handleSignalingMessage(data: any): void {
+  private async handleSignalingMessage(data: any): Promise<void> {
     if (!this.currentUser) return
 
     switch (data.type) {
-      case "peer_announcement":
+      case "user_joined":
         if (data.userId !== this.currentUser.id) {
-          console.log("[v0] Discovered peer via signaling:", data.userId, data.userData?.username)
-          this.handlePeerDiscovery(data.userId, data.userData)
+          console.log("[v0] User joined:", data.userId, data.userData?.username)
+          await this.createPeerConnection(data.userId, data.userData, true)
+        }
+        break
+
+      case "user_list":
+        console.log("[v0] Received user list:", data.users)
+        for (const user of data.users || []) {
+          if (user.userId !== this.currentUser.id) {
+            await this.createPeerConnection(user.userId, user.userData, false)
+          }
+        }
+        break
+
+      case "webrtc_offer":
+        if (data.targetId === this.currentUser.id && data.fromId !== this.currentUser.id) {
+          console.log("[v0] Received WebRTC offer from:", data.fromId)
+          await this.handleOffer(data.fromId, data.offer)
+        }
+        break
+
+      case "webrtc_answer":
+        if (data.targetId === this.currentUser.id && data.fromId !== this.currentUser.id) {
+          console.log("[v0] Received WebRTC answer from:", data.fromId)
+          await this.handleAnswer(data.fromId, data.answer)
+        }
+        break
+
+      case "webrtc_ice_candidate":
+        if (data.targetId === this.currentUser.id && data.fromId !== this.currentUser.id) {
+          console.log("[v0] Received ICE candidate from:", data.fromId)
+          await this.handleIceCandidate(data.fromId, data.candidate)
         }
         break
 
@@ -176,32 +200,218 @@ export class P2PNetworkManager {
           this.handleIncomingMessage(data)
         }
         break
+    }
+  }
 
-      case "peer_list":
-        console.log("[v0] Received peer list:", data.peers)
-        data.peers?.forEach((peer: any) => {
-          if (peer.userId !== this.currentUser?.id) {
-            this.handlePeerDiscovery(peer.userId, peer.userData)
-          }
-        })
-        break
+  private async createPeerConnection(peerId: string, userData: any, shouldCreateOffer: boolean): Promise<void> {
+    if (this.peers.has(peerId)) return
+
+    try {
+      console.log("[v0] Creating WebRTC connection to:", peerId, userData?.username)
+
+      const peerConnection = new RTCPeerConnection(this.rtcConfig)
+      const dataChannel = shouldCreateOffer ? peerConnection.createDataChannel("messages") : null
+
+      const peer: PeerConnection = {
+        id: peerId,
+        connection: peerConnection,
+        dataChannel: dataChannel || undefined,
+        isConnected: false,
+      }
+
+      this.peers.set(peerId, peer)
+
+      // Handle ICE candidates
+      peerConnection.onicecandidate = (event) => {
+        if (event.candidate && this.signalingServer?.readyState === WebSocket.OPEN) {
+          console.log("[v0] Sending ICE candidate to:", peerId)
+          this.signalingServer.send(
+            JSON.stringify({
+              type: "webrtc_ice_candidate",
+              fromId: this.currentUser?.id,
+              targetId: peerId,
+              candidate: event.candidate,
+            }),
+          )
+        }
+      }
+
+      // Handle connection state changes
+      peerConnection.onconnectionstatechange = () => {
+        console.log("[v0] Connection state changed:", peerId, peerConnection.connectionState)
+        const isConnected = peerConnection.connectionState === "connected"
+        peer.isConnected = isConnected
+        this.notifyPeerStatus(peerId, isConnected)
+
+        if (isConnected) {
+          console.log("[v0] WebRTC connection established with:", peerId)
+        }
+      }
+
+      // Handle incoming data channel
+      peerConnection.ondatachannel = (event) => {
+        console.log("[v0] Received data channel from:", peerId)
+        const channel = event.channel
+        peer.dataChannel = channel
+        this.setupDataChannel(channel, peerId)
+      }
+
+      // Setup data channel if we created it
+      if (dataChannel) {
+        this.setupDataChannel(dataChannel, peerId)
+      }
+
+      // Create offer if we should initiate
+      if (shouldCreateOffer) {
+        const offer = await peerConnection.createOffer()
+        await peerConnection.setLocalDescription(offer)
+
+        if (this.signalingServer?.readyState === WebSocket.OPEN) {
+          console.log("[v0] Sending WebRTC offer to:", peerId)
+          this.signalingServer.send(
+            JSON.stringify({
+              type: "webrtc_offer",
+              fromId: this.currentUser?.id,
+              targetId: peerId,
+              offer: offer,
+            }),
+          )
+        }
+      }
+    } catch (error) {
+      console.error("[v0] Error creating peer connection:", error)
+      this.peers.delete(peerId)
+    }
+  }
+
+  private setupDataChannel(channel: RTCDataChannel, peerId: string): void {
+    channel.onopen = () => {
+      console.log("[v0] Data channel opened with:", peerId)
+      const peer = this.peers.get(peerId)
+      if (peer) {
+        peer.isConnected = true
+        this.notifyPeerStatus(peerId, true)
+      }
+    }
+
+    channel.onclose = () => {
+      console.log("[v0] Data channel closed with:", peerId)
+      const peer = this.peers.get(peerId)
+      if (peer) {
+        peer.isConnected = false
+        this.notifyPeerStatus(peerId, false)
+      }
+    }
+
+    channel.onmessage = (event) => {
+      try {
+        const message = JSON.parse(event.data)
+        console.log("[v0] Received P2P message from:", peerId, message)
+        this.handleIncomingMessage(message)
+      } catch (error) {
+        console.error("[v0] Error parsing P2P message:", error)
+      }
+    }
+
+    channel.onerror = (error) => {
+      console.error("[v0] Data channel error with:", peerId, error)
+    }
+  }
+
+  private async handleOffer(fromId: string, offer: RTCSessionDescriptionInit): Promise<void> {
+    try {
+      let peer = this.peers.get(fromId)
+      if (!peer) {
+        await this.createPeerConnection(fromId, null, false)
+        peer = this.peers.get(fromId)
+      }
+
+      if (!peer) return
+
+      await peer.connection.setRemoteDescription(offer)
+      const answer = await peer.connection.createAnswer()
+      await peer.connection.setLocalDescription(answer)
+
+      if (this.signalingServer?.readyState === WebSocket.OPEN) {
+        console.log("[v0] Sending WebRTC answer to:", fromId)
+        this.signalingServer.send(
+          JSON.stringify({
+            type: "webrtc_answer",
+            fromId: this.currentUser?.id,
+            targetId: fromId,
+            answer: answer,
+          }),
+        )
+      }
+
+      // Process any pending ICE candidates
+      const candidates = this.pendingCandidates.get(fromId) || []
+      for (const candidate of candidates) {
+        await peer.connection.addIceCandidate(candidate)
+      }
+      this.pendingCandidates.delete(fromId)
+    } catch (error) {
+      console.error("[v0] Error handling offer:", error)
+    }
+  }
+
+  private async handleAnswer(fromId: string, answer: RTCSessionDescriptionInit): Promise<void> {
+    try {
+      const peer = this.peers.get(fromId)
+      if (!peer) return
+
+      await peer.connection.setRemoteDescription(answer)
+
+      // Process any pending ICE candidates
+      const candidates = this.pendingCandidates.get(fromId) || []
+      for (const candidate of candidates) {
+        await peer.connection.addIceCandidate(candidate)
+      }
+      this.pendingCandidates.delete(fromId)
+    } catch (error) {
+      console.error("[v0] Error handling answer:", error)
+    }
+  }
+
+  private async handleIceCandidate(fromId: string, candidate: RTCIceCandidate): Promise<void> {
+    try {
+      const peer = this.peers.get(fromId)
+      if (!peer) {
+        // Store candidate for later
+        if (!this.pendingCandidates.has(fromId)) {
+          this.pendingCandidates.set(fromId, [])
+        }
+        this.pendingCandidates.get(fromId)!.push(candidate)
+        return
+      }
+
+      if (peer.connection.remoteDescription) {
+        await peer.connection.addIceCandidate(candidate)
+      } else {
+        // Store candidate for later
+        if (!this.pendingCandidates.has(fromId)) {
+          this.pendingCandidates.set(fromId, [])
+        }
+        this.pendingCandidates.get(fromId)!.push(candidate)
+      }
+    } catch (error) {
+      console.error("[v0] Error handling ICE candidate:", error)
     }
   }
 
   private scheduleReconnect(): void {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-      console.log("[v0] Max reconnection attempts reached, using global storage only")
+      console.log("[v0] Max reconnection attempts reached, using fallback only")
       this.setupFallbackCommunication()
       return
     }
 
-    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 10000)
+    const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000)
     this.reconnectAttempts++
 
     console.log(`[v0] Scheduling reconnect attempt ${this.reconnectAttempts} in ${delay}ms`)
     setTimeout(() => {
       if (this.isNetworkOnline && this.isInitialized) {
-        this.currentServerIndex = (this.currentServerIndex + 1) % this.SIGNALING_SERVERS.length
         this.connectToSignalingServer().catch(() => {
           this.scheduleReconnect()
         })
@@ -209,127 +419,22 @@ export class P2PNetworkManager {
     }, delay)
   }
 
-  private setupGlobalStorage(): void {
-    if (typeof window === "undefined") return
-
-    this.storeGlobalPresence()
-
-    setInterval(() => {
-      this.checkGlobalMessages()
-    }, 2000)
-
-    setInterval(() => {
-      this.cleanupGlobalStorage()
-    }, 10000)
-  }
-
-  private storeGlobalPresence(): void {
-    if (!this.currentUser || typeof window === "undefined") return
-
-    try {
-      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
-      const now = Date.now()
-
-      globalData.users = globalData.users || {}
-      globalData.users[this.currentUser.id] = {
-        username: this.currentUser.username,
-        publicKey: this.currentUser.publicKey,
-        lastSeen: now,
-        isOnline: true,
-      }
-
-      localStorage.setItem(this.globalStorageKey, JSON.stringify(globalData))
-      console.log("[v0] Stored global presence for:", this.currentUser.username)
-    } catch (error) {
-      console.error("[v0] Error storing global presence:", error)
-    }
-  }
-
-  private checkGlobalMessages(): void {
-    if (!this.currentUser || typeof window === "undefined") return
-
-    try {
-      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
-      const myMessages = messageQueue.filter(
-        (msg: any) =>
-          msg.recipientId === this.currentUser?.id && msg.senderId !== this.currentUser?.id && !msg.processed,
-      )
-
-      myMessages.forEach((message: any) => {
-        console.log("[v0] Processing queued message:", message)
-        this.handleIncomingMessage(message)
-        message.processed = true
-      })
-
-      if (myMessages.length > 0) {
-        localStorage.setItem(this.messageQueueKey, JSON.stringify(messageQueue))
-      }
-    } catch (error) {
-      console.error("[v0] Error checking global messages:", error)
-    }
-  }
-
-  private cleanupGlobalStorage(): void {
-    if (typeof window === "undefined") return
-
-    try {
-      const now = Date.now()
-      const maxAge = 60000
-
-      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
-      if (globalData.users) {
-        Object.keys(globalData.users).forEach((userId) => {
-          if (now - globalData.users[userId].lastSeen > maxAge) {
-            delete globalData.users[userId]
-            this.peers.delete(userId)
-            this.notifyPeerStatus(userId, false)
-          }
-        })
-        localStorage.setItem(this.globalStorageKey, JSON.stringify(globalData))
-      }
-
-      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
-      const cleanQueue = messageQueue.filter((msg: any) => now - msg.timestamp < maxAge || !msg.processed)
-      localStorage.setItem(this.messageQueueKey, JSON.stringify(cleanQueue))
-    } catch (error) {
-      console.error("[v0] Error cleaning up global storage:", error)
-    }
-  }
-
-  private processQueuedMessages(): void {
-    this.checkGlobalMessages()
-
-    try {
-      const globalData = JSON.parse(localStorage.getItem(this.globalStorageKey) || "{}")
-      if (globalData.users) {
-        Object.entries(globalData.users).forEach(([userId, userData]: [string, any]) => {
-          if (userId !== this.currentUser?.id) {
-            this.handlePeerDiscovery(userId, userData)
-          }
-        })
-      }
-    } catch (error) {
-      console.error("[v0] Error processing queued messages:", error)
-    }
-  }
-
   private setupFallbackCommunication(): void {
-    console.log("[v0] Setting up fallback global storage communication")
+    console.log("[v0] Setting up fallback communication (same-browser only)")
     this.setupCrossTabCommunication()
-    this.setupGlobalStorage()
   }
 
   private setupCrossTabCommunication(): void {
     if (typeof window === "undefined") return
 
     if (typeof BroadcastChannel !== "undefined") {
-      this.broadcastChannel = new BroadcastChannel("p2p-chat-demo")
+      this.broadcastChannel = new BroadcastChannel("p2p-chat-webrtc")
       this.broadcastChannel.onmessage = (event) => {
         this.handleCrossTabMessage(event.data)
       }
     } else {
       this.storageEventListener = (event) => {
-        if (event.key === "p2p-chat-messages" && event.newValue) {
+        if (event.key === "p2p-chat-webrtc-messages" && event.newValue) {
           try {
             const message = JSON.parse(event.newValue)
             this.handleCrossTabMessage(message)
@@ -354,102 +459,6 @@ export class P2PNetworkManager {
 
       console.log("[v0] Received cross-tab message:", data.message)
       this.handleIncomingMessage(data.message)
-    } else if (data.type === "peer_announcement") {
-      if (data.userId !== this.currentUser?.id) {
-        console.log("[v0] Discovered peer:", data.userId)
-        this.handlePeerDiscovery(data.userId, data.userData)
-      }
-    }
-  }
-
-  private handlePeerDiscovery(peerId: string, userData: any): void {
-    if (!this.peers.has(peerId)) {
-      const mockPeer: PeerConnection = {
-        id: peerId,
-        connection: new RTCPeerConnection(),
-        isConnected: true,
-      }
-
-      this.peers.set(peerId, mockPeer)
-      this.notifyPeerStatus(peerId, true)
-      console.log("[v0] Added peer:", peerId, userData?.username, "Total peers:", this.peers.size)
-
-      this.storePeerInfo(peerId, userData)
-    }
-  }
-
-  private storePeerInfo(peerId: string, userData: any): void {
-    if (typeof window === "undefined") return
-
-    try {
-      const existingPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
-      existingPeers[peerId] = {
-        ...userData,
-        lastSeen: Date.now(),
-      }
-      localStorage.setItem("p2p-discovered-peers", JSON.stringify(existingPeers))
-    } catch (error) {
-      console.error("Error storing peer info:", error)
-    }
-  }
-
-  private setupPeerDiscovery(): void {
-    this.loadStoredPeers()
-
-    setInterval(() => {
-      if (this.isInitialized && this.currentUser) {
-        this.announcePresence()
-        this.storeGlobalPresence()
-      }
-    }, 5000)
-
-    setInterval(() => {
-      this.cleanupOldPeers()
-    }, 10000)
-  }
-
-  private loadStoredPeers(): void {
-    if (typeof window === "undefined") return
-
-    try {
-      const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
-      const now = Date.now()
-      const maxAge = 30000
-
-      Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
-        if (now - peerData.lastSeen < maxAge && peerId !== this.currentUser?.id) {
-          this.handlePeerDiscovery(peerId, peerData)
-        }
-      })
-    } catch (error) {
-      console.error("Error loading stored peers:", error)
-    }
-  }
-
-  private cleanupOldPeers(): void {
-    if (typeof window === "undefined") return
-
-    try {
-      const storedPeers = JSON.parse(localStorage.getItem("p2p-discovered-peers") || "{}")
-      const now = Date.now()
-      const maxAge = 30000
-
-      let hasChanges = false
-      Object.entries(storedPeers).forEach(([peerId, peerData]: [string, any]) => {
-        if (now - peerData.lastSeen > maxAge) {
-          delete storedPeers[peerId]
-          this.peers.delete(peerId)
-          this.notifyPeerStatus(peerId, false)
-          hasChanges = true
-          console.log("[v0] Removed old peer:", peerId)
-        }
-      })
-
-      if (hasChanges) {
-        localStorage.setItem("p2p-discovered-peers", JSON.stringify(storedPeers))
-      }
-    } catch (error) {
-      console.error("Error cleaning up old peers:", error)
     }
   }
 
@@ -482,36 +491,39 @@ export class P2PNetworkManager {
       signature,
     }
 
-    console.log("[v0] Sending direct message:", message)
+    console.log("[v0] Sending direct message to:", recipientId, "content:", content)
 
+    // Try to send via WebRTC data channel first
+    const peer = this.peers.get(recipientId)
+    if (peer?.dataChannel && peer.dataChannel.readyState === "open") {
+      try {
+        peer.dataChannel.send(JSON.stringify(message))
+        console.log("[v0] Message sent via WebRTC data channel")
+        return
+      } catch (error) {
+        console.error("[v0] Failed to send via data channel:", error)
+      }
+    }
+
+    // Fallback to signaling server
     if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
       try {
         this.signalingServer.send(JSON.stringify(message))
         console.log("[v0] Message sent via signaling server")
+        return
       } catch (error) {
         console.error("[v0] Failed to send via signaling server:", error)
       }
     }
 
-    try {
-      const messageQueue = JSON.parse(localStorage.getItem(this.messageQueueKey) || "[]")
-      messageQueue.push({
-        ...message,
-        processed: false,
-      })
-      localStorage.setItem(this.messageQueueKey, JSON.stringify(messageQueue))
-      console.log("[v0] Message queued in global storage")
-    } catch (error) {
-      console.error("[v0] Failed to queue message:", error)
-    }
-
+    // Final fallback to cross-tab communication (same browser only)
     this.broadcastCrossTabMessage({
       type: "network_message",
       message,
       targetRecipient: recipientId,
     })
 
-    console.log("[v0] Message sent over network")
+    console.log("[v0] Message sent via fallback method")
   }
 
   async sendGroupMessage(groupId: string, content: string, signature?: string): Promise<void> {
@@ -530,9 +542,29 @@ export class P2PNetworkManager {
 
     console.log("[v0] Sending group message:", message)
 
+    // Broadcast to all connected peers via data channels
+    let sentViaDataChannel = false
+    this.peers.forEach((peer) => {
+      if (peer.dataChannel && peer.dataChannel.readyState === "open") {
+        try {
+          peer.dataChannel.send(JSON.stringify(message))
+          sentViaDataChannel = true
+        } catch (error) {
+          console.error("[v0] Failed to send group message via data channel:", error)
+        }
+      }
+    })
+
+    if (sentViaDataChannel) {
+      console.log("[v0] Group message sent via WebRTC data channels")
+      return
+    }
+
+    // Fallback to signaling server
     if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
       try {
         this.signalingServer.send(JSON.stringify(message))
+        console.log("[v0] Group message sent via signaling server")
       } catch (error) {
         console.error("[v0] Failed to send group message via signaling server:", error)
       }
@@ -563,7 +595,7 @@ export class P2PNetworkManager {
     }
 
     const announcement = {
-      type: "peer_announcement",
+      type: "user_join",
       userId: this.currentUser.id,
       userData,
     }
@@ -571,15 +603,15 @@ export class P2PNetworkManager {
     if (this.signalingServer && this.signalingServer.readyState === WebSocket.OPEN) {
       try {
         this.signalingServer.send(JSON.stringify(announcement))
-        console.log("[v0] Announced presence via signaling server")
+        console.log("[v0] Announced presence to signaling server")
       } catch (error) {
-        console.error("[v0] Failed to announce presence via signaling server:", error)
+        console.error("[v0] Failed to announce presence:", error)
       }
     }
 
     this.broadcastCrossTabMessage(announcement)
 
-    console.log("[v0] Announced presence for:", this.currentUser.username, "Peers:", this.peers.size)
+    console.log("[v0] Announced presence for:", this.currentUser.username, "WebRTC Peers:", this.peers.size)
   }
 
   async updateStatus(isOnline: boolean): Promise<void> {
@@ -590,7 +622,6 @@ export class P2PNetworkManager {
 
     if (isOnline) {
       await this.announcePresence()
-      this.storeGlobalPresence()
     }
   }
 
@@ -642,6 +673,9 @@ export class P2PNetworkManager {
     }
 
     this.peers.forEach((peer) => {
+      if (peer.dataChannel) {
+        peer.dataChannel.close()
+      }
       peer.connection.close()
     })
     this.peers.clear()
@@ -651,6 +685,10 @@ export class P2PNetworkManager {
       this.signalingServer = null
     }
 
+    this.pendingOffers.clear()
+    this.pendingAnswers.clear()
+    this.pendingCandidates.clear()
+
     this.isInitialized = false
   }
 
@@ -658,16 +696,16 @@ export class P2PNetworkManager {
     if (this.broadcastChannel) {
       this.broadcastChannel.postMessage(data)
     } else {
-      localStorage.setItem("p2p-chat-messages", JSON.stringify(data))
+      localStorage.setItem("p2p-chat-webrtc-messages", JSON.stringify(data))
       window.dispatchEvent(
         new StorageEvent("storage", {
-          key: "p2p-chat-messages",
+          key: "p2p-chat-webrtc-messages",
           newValue: JSON.stringify(data),
           url: window.location.href,
         }),
       )
       setTimeout(() => {
-        localStorage.removeItem("p2p-chat-messages")
+        localStorage.removeItem("p2p-chat-webrtc-messages")
       }, 100)
     }
   }
